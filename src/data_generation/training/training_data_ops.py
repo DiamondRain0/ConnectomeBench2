@@ -980,6 +980,7 @@ def _collect_adj_candidates(
                         "root_id": op_result.root_id,
                         "species": op_result.species,
                         "interface_point_nm": op_result.interface_point_nm,
+                        "edit_point_nm": getattr(op_result, "edit_point_nm", op_result.interface_point_nm),
                         "before_root_ids": op_result.before_root_ids,
                         "after_root_ids": op_result.after_root_ids,
                         "timestamp": op_result.timestamp,
@@ -1135,7 +1136,8 @@ def generate_adjacent_endpoint_samples(
                 after_root_ids=[],
                 before_timestamp=cand["timestamp"] - 1,
                 after_timestamp=cand["timestamp"] + 1,
-                metadata={"adjacent_root": adj_root, "base_root": base_root, "pair_source": pair_source, "cutout_timestamp": cand["cutout_timestamp"]},
+                metadata={"adjacent_root": adj_root, "base_root": base_root, "pair_source": pair_source, "cutout_timestamp": cand["cutout_timestamp"],
+                          "edit_point_nm": cand.get("edit_point_nm", cand["interface_point_nm"])},
             ))
 
     if max_controls and len(controls) > max_controls:
@@ -1322,6 +1324,7 @@ def derive_jobs_from_operation(
         "timestamp": op.timestamp,
         "source_type": "operation",
         "interface_point_nm": op.interface_point_nm,
+        "edit_point_nm": getattr(op, "edit_point_nm", op.interface_point_nm),  # v2 split coordinate
         "before_root_ids": op.before_root_ids,   # original (provenance)
         "after_root_ids": op.after_root_ids,      # original (provenance)
         "view_extent_nm": extent_nm,

@@ -310,8 +310,12 @@ class MultiTaskViT(nn.Module):
         init_source: str = "imagenet",
         fm_checkpoint_path: str | None = None,
         em_enabled: bool = True,
+        use_view_embedding: bool = True,
     ) -> None:
         super().__init__()
+        if init_source not in ("imagenet", "none", "fm_checkpoint"):
+            raise ValueError(f"init_source must be imagenet | none | fm_checkpoint, got {init_source!r}")
+        self.use_view_embedding = bool(use_view_embedding)
         backbone = _create_vit_backbone(
             model_name=model_name,
             pretrained=(init_source == "imagenet"),
@@ -437,13 +441,21 @@ class MultiTaskViT(nn.Module):
         return seq[:, 0], seq[:, 1:]
 
     def forward(
-        self, x: torch.Tensor, modality: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        x: torch.Tensor,
+        modality: torch.Tensor,
+        view_idx: torch.Tensor | None = None,
+        return_features: bool = False,
+    ):
         """x: (B, 7, H, W). modality: (B,) long (0=geom, 1=em).
+        view_idx: (B,) long; for geom rows 0=front, 1=side, 2=top. When given and
+            `use_view_embedding`, a learned view embedding is added to the patch
+            grid before the mask decoder (paper App. B.2). EM rows get no embedding.
 
         Returns:
             (endpoint_logits, junction_logits, mask_logits, synapse_logits)
-            shapes (B,2), (B,2), (B,2,h,w), (B,2)
+            shapes (B,2), (B,2), (B,2,h,w), (B,2); plus the CLS feature (B, D)
+            as a 5th element when `return_features=True`.
         """
         cls_tok, patch_tok = self._encode(x, modality)
         B, N, D = patch_tok.shape
@@ -452,7 +464,13 @@ class MultiTaskViT(nn.Module):
         junction_logits = self.cls_junction(cls_tok)
         synapse_logits = self.cls_synapse(cls_tok)
         feat = patch_tok.permute(0, 2, 1).reshape(B, D, h, w)
+        if self.use_view_embedding and view_idx is not None:
+            emb = self.mask_head.view_emb(view_idx.clamp(0, 2))            # (B, D)
+            is_geom = (modality == MODALITY_GEOM).to(emb.dtype).unsqueeze(-1)
+            feat = feat + (emb * is_geom).to(feat.dtype)[:, :, None, None]
         mask_logits = self.mask_head.decoder(feat)
+        if return_features:
+            return endpoint_logits, junction_logits, mask_logits, synapse_logits, cls_tok
         return endpoint_logits, junction_logits, mask_logits, synapse_logits
 
 
@@ -467,6 +485,7 @@ def build_model(
     fm_checkpoint_path: str | None = None,
     em_enabled: bool = True,
     warmstart_checkpoint_path: str | None = None,
+    use_view_embedding: bool = True,
 ) -> MultiTaskViT:
     """Build a MultiTaskViT and optionally hot-start from a prior best.pt.
 
@@ -491,6 +510,7 @@ def build_model(
         init_source=init_source,
         fm_checkpoint_path=fm_checkpoint_path,
         em_enabled=em_enabled,
+        use_view_embedding=use_view_embedding,
     )
     if warmstart_checkpoint_path is not None:
         load_warmstart_checkpoint(model, warmstart_checkpoint_path)

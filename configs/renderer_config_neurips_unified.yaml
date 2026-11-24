@@ -7,8 +7,11 @@ defaults:
   view_extent_nm: [5000, 10000]          # mouse default, per-species overrides below
   center_jitter_nm: 300
 
-  # geometry-only (7ch npy: normals+depth+mask A/B) + EM via em_cutout block below
-  render_modes: [geometry]
+  # 7ch geometry npy (silhouette, depth, normals, mask A/B) + EM via em_cutout block below.
+  # ConnectomeBench2 v2 needs BOTH flavours: `geometry` (dual, pre-merge pair) for
+  # merge_edit / adjacent controls, and `geometry_single` (the single merged segment)
+  # for split_edit rows. Split-mask GT is added afterwards with --split-mask-enrich.
+  render_modes: [geometry, geometry_single]
   geometry:
     resolution: 224
     angles: [front, side, top]

@@ -1,10 +1,10 @@
 [project]
 name = "ConnectomeBench2"
-version = "0.0.1"
+version = "0.0.2"
 description = "ConnectomeBench: data generation + benchmarks for neural-circuit proofreading models"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    # core
+    # core (shared by training and data generation)
     "numpy<2",
     "pandas",
     "pyarrow>=18",
@@ -12,27 +12,37 @@ dependencies = [
     "tqdm",
     "pyyaml",
     "h5py",
-    # CAVE / cloud / mesh data
+    "scipy",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+# Training / evaluation on the released HF parquet shards (GPU box).
+#   uv sync --extra train
+train = [
+    "torch>=2.2",          # provides the `torchrun` launcher
+    "torchvision>=0.17",
+    "scikit-learn",        # ROC-AUC
+    "huggingface_hub",     # dataset download
+    "wandb",               # optional logging (--wandb)
+]
+# Data generation from CAVE / CloudVolume + offscreen mesh rendering.
+#   uv sync --extra datagen
+datagen = [
     "caveclient>=7.7.4",
     "cloud-volume",
     "diskcache>=5.6.3",
     "pcg-skel>=0.3.0",
-    # rendering (octarine3d / pygfx headless)
+    "networkx",
     "pygfx>=0.7.0",
     "octarine3d>=0.3.2,<0.4",
     "rendercanvas>=2.1.2",
     "pylinalg>=0.6.7",
     "freetype-py>=2.5.1",
     "pypng",
-    # sci utils used in renderer / em_data
-    "scipy",
     "scikit-image",
     "trimesh",
-    "python-dotenv",
-    "torchrun>=0.2.9",
 ]
-
-[project.optional-dependencies]
 dev = ["pytest", "pytest-timeout", "ruff"]
 
 [tool.uv]

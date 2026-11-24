@@ -1,15 +1,19 @@
-"""Pack combined.parquet + image files into HuggingFace-native parquet shards.
+"""Pack the postprocessed combined.parquet + image files into ConnectomeBench2 **v2**
+HuggingFace parquet shards (same schema as `jeffbbrown2/ConnectomeBench2@v2`).
 
-Each parquet row = 1 sample. Image bytes are stored as binary columns. Missing
-modalities are nulls (no sentinel needed; parquet handles nullable cleanly).
+Each parquet row = 1 sample. Input: combined.parquet after
+postprocess_giga_parquet.py (v2 semantics; `images` = paths aligned with
+`metadata.image_types`).
 
-Schema per row:
-  - identifier / label / split cols (str / bool / list<str>)
-  - metadata (str, JSON)
-  - present_slots (list<str>)
-  - geometry        : bytes  (compressed npz, nullable)
-  - geometry_single : bytes  (compressed npz, nullable)
-  - em_xy / em_xz / em_yz / em_best : bytes (PNG, nullable)
+Schema per row (column order as in the release):
+  combined_sample_hash, source_archive_sample_hash, source_archive, sample_type,
+  same_neuron, task_routing, false_split_correction_label (double, null),
+  false_merge_identification_label (double, null), split, species, has_em,
+  has_after_mask, present_slots, metadata (JSON str),
+  geometry : binary (npz, arr_0 = (3, 7, 224, 224) float16)
+  em_{xy,xz,yz,best}_before : HF Image {bytes, path}  (PNG RGB)
+  split_mask_{front,side,top} : HF Image {bytes, path} (PNG L; 0 = piece A,
+                                1 = piece B, 255 = background)
 
 Layout:
   out_root/
@@ -49,9 +53,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-GIGA_DEFAULT = (
-    Path.home() / "VLM_Proofreading" / "neurips_dataset_may06" / "combined.parquet"
-)
+GIGA_DEFAULT = Path.home() / "VLM_Proofreading" / "neurips_dataset" / "combined.parquet"
 OUT_ROOT_DEFAULT = Path("/tmp/parquet_build")
 DEFAULT_SHARD_BYTES = int(2.5e8)
 DEFAULT_WORKERS = 8
@@ -65,30 +67,65 @@ KEEP_COLS: tuple[str, ...] = (
     "source_archive",
     "sample_type",
     "same_neuron",
-    "has_single_mask",
-    "has_dual_mask",
     "task_routing",
     "false_split_correction_label",
     "false_merge_identification_label",
     "split",
+    "species",
+    "has_em",
+    "has_after_mask",
+    "present_slots",
 )
 
-EXT_BY_TYPE: dict[str, str] = {
-    "geometry": "npz",
-    "geometry_single": "npz",
-    "em_xy": "png",
-    "em_xz": "png",
-    "em_yz": "png",
-    "em_best": "png",
-}
-COMPRESS_TAGS = frozenset({"geometry", "geometry_single"})
-IMAGE_TAGS = frozenset({"em_xy", "em_xz", "em_yz", "em_best"})
+EM_TAGS: tuple[str, ...] = ("em_xy_before", "em_xz_before", "em_yz_before", "em_best_before")
+MASK_TAGS: tuple[str, ...] = ("split_mask_front", "split_mask_side", "split_mask_top")
+EXT_BY_TYPE: dict[str, str] = {"geometry": "npz", **{t: "png" for t in EM_TAGS},
+                               **{t: "png" for t in MASK_TAGS}}
+COMPRESS_TAGS = frozenset({"geometry"})
+IMAGE_TAGS = frozenset(EM_TAGS + MASK_TAGS)
 BYTES_COLUMNS: tuple[str, ...] = tuple(EXT_BY_TYPE.keys())
 
 HF_IMAGE_STRUCT = pa.struct([
     pa.field("bytes", pa.binary()),
     pa.field("path", pa.string()),
 ])
+
+V2_SCHEMA = pa.schema(
+    [
+        pa.field("combined_sample_hash", pa.string()),
+        pa.field("source_archive_sample_hash", pa.string()),
+        pa.field("source_archive", pa.string()),
+        pa.field("sample_type", pa.string()),
+        pa.field("same_neuron", pa.bool_()),
+        pa.field("task_routing", pa.list_(pa.string())),
+        pa.field("false_split_correction_label", pa.float64()),
+        pa.field("false_merge_identification_label", pa.float64()),
+        pa.field("split", pa.string()),
+        pa.field("species", pa.string()),
+        pa.field("has_em", pa.bool_()),
+        pa.field("has_after_mask", pa.bool_()),
+        pa.field("present_slots", pa.list_(pa.string())),
+        pa.field("metadata", pa.string()),
+        pa.field("geometry", pa.binary()),
+        *[pa.field(t, HF_IMAGE_STRUCT) for t in EM_TAGS],
+        *[pa.field(t, HF_IMAGE_STRUCT) for t in MASK_TAGS],
+    ]
+)
+
+
+def _split_mask_png_v2(path: Path) -> bytes:
+    """Renderer split mask (0 = A, 128 = B, 255 = bg) → v2 PNG (0 = A, 1 = B, 255 = bg)."""
+    import numpy as np
+    from PIL import Image
+    a = np.asarray(Image.open(path))
+    if a.ndim == 3:
+        a = a[..., 0]
+    out = np.full(a.shape, 255, dtype=np.uint8)
+    out[a == 0] = 0
+    out[(a == 1) | (a == 128)] = 1
+    buf = io.BytesIO()
+    Image.fromarray(out, mode="L").save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def setup_logging() -> None:
@@ -119,6 +156,9 @@ def py_value(v: Any) -> Any:
 
 def row_to_dict(row: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    missing = [c for c in KEEP_COLS if c not in row.index]
+    if missing:
+        raise KeyError(f"combined.parquet lacks {missing}; run postprocess_giga_parquet.py first")
     for c in KEEP_COLS:
         out[c] = py_value(row[c])
     images = row["images"]
@@ -227,9 +267,13 @@ def read_sample(row: dict[str, Any], parquet_root: Path) -> dict[str, Any] | Non
         try:
             if tag in COMPRESS_TAGS:
                 arr = np.load(full)
+                if arr.dtype != np.float16:
+                    arr = arr.astype(np.float16)
                 buf = io.BytesIO()
                 np.savez_compressed(buf, arr)
                 bytes_by_col[tag] = buf.getvalue()
+            elif tag in MASK_TAGS:
+                bytes_by_col[tag] = _split_mask_png_v2(full)
             else:
                 bytes_by_col[tag] = full.read_bytes()
             present.append(tag)
@@ -240,10 +284,13 @@ def read_sample(row: dict[str, Any], parquet_root: Path) -> dict[str, Any] | Non
     record: dict[str, Any] = {}
     for c in KEEP_COLS:
         record[c] = row.get(c)
-    record["species"] = meta.get("species")
+    for c in ("false_split_correction_label", "false_merge_identification_label"):
+        v = record[c]
+        record[c] = None if v is None or (isinstance(v, float) and math.isnan(v)) else float(v)
     record["has_em"] = any(s.startswith("em_") for s in present)
+    record["has_after_mask"] = bool(record.get("has_after_mask")) and all(t in present for t in MASK_TAGS)
     record["present_slots"] = sorted(present)
-    record["metadata"] = json.dumps(meta, default=str) if meta is not None else None
+    record["metadata"] = json.dumps(meta, sort_keys=True, default=str) if meta is not None else None
     for c in BYTES_COLUMNS:
         b = bytes_by_col[c]
         if c in IMAGE_TAGS:
@@ -286,15 +333,7 @@ def pack_shard(args: tuple[ShardJob, Path, Path, int, int]) -> dict[str, Any]:
                 continue
             records.append(rec)
 
-    table = pa.Table.from_pylist(records)
-    new_fields: list[pa.Field] = []
-    for f in table.schema:
-        if f.name in IMAGE_TAGS:
-            new_fields.append(pa.field(f.name, HF_IMAGE_STRUCT, nullable=True))
-        else:
-            new_fields.append(f)
-    target_schema = pa.schema(new_fields, metadata=_hf_features_metadata())
-    table = table.cast(target_schema)
+    table = pa.Table.from_pylist(records, schema=V2_SCHEMA.with_metadata(_hf_features_metadata()))
     pq.write_table(
         table,
         tmp_path,
@@ -349,6 +388,12 @@ def write_shards_csv(
     log.info(f"wrote {out} ({len(rows)} shards)")
 
 
+def _nullable_float(v: Any) -> float | None:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    return float(v)
+
+
 def write_metadata_sidecars(
     out_root: Path,
     rows_by_split: dict[str, list[dict[str, Any]]],
@@ -376,14 +421,13 @@ def write_metadata_sidecars(
                 "source_archive": r["source_archive"],
                 "sample_type": r["sample_type"],
                 "same_neuron": r["same_neuron"],
-                "has_single_mask": r["has_single_mask"],
-                "has_dual_mask": r["has_dual_mask"],
                 "has_em": any(t.startswith("em_") for t in (meta.get("image_types") or [])),
+                "has_after_mask": bool(r.get("has_after_mask")),
                 "task_routing": list(r.get("task_routing") or []),
-                "false_split_correction_label": r["false_split_correction_label"],
-                "false_merge_identification_label": r["false_merge_identification_label"],
+                "false_split_correction_label": _nullable_float(r["false_split_correction_label"]),
+                "false_merge_identification_label": _nullable_float(r["false_merge_identification_label"]),
                 "split": r["split"],
-                "species": meta.get("species"),
+                "species": r.get("species") or meta.get("species"),
                 "shard": key_to_shard.get(r["combined_sample_hash"], ""),
             })
         out_pq = meta_dir / f"{split}.parquet"
@@ -404,8 +448,8 @@ def write_demo(
         eligible = [
             r for r in candidates
             if r["split"] == "train"
-            and r["has_dual_mask"]
-            and (st == "junction_control" or any(t.startswith("em_") for t in (r["metadata"] or {}).get("image_types", [])))
+            and r.get("has_em")
+            and (st != "split_edit" or r.get("has_after_mask"))
         ]
         if not eligible:
             eligible = [r for r in candidates if r["split"] == "train"]
@@ -420,7 +464,7 @@ def write_demo(
         if rec is None:
             continue
         records.append(rec)
-    table = pa.Table.from_pylist(records)
+    table = pa.Table.from_pylist(records, schema=V2_SCHEMA.with_metadata(_hf_features_metadata()))
     pq.write_table(
         table,
         tmp,

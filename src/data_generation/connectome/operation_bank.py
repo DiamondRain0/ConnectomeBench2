@@ -47,6 +47,20 @@ class ConnectomeOperation:
     user_id: Optional[str] = None
 
     @property
+    def edit_point_nm(self) -> List[float]:
+        """Average of all proofreader source + sink seed points (nm).
+
+        This is the per-edit coordinate used by ConnectomeBench2 v2 for the
+        spatial train/val/test cube assignment (paper §3.1.2: "average of the
+        sink and source points"). It differs from `interface_point_nm` (the
+        midpoint of the two centroids) when the seed counts differ.
+        """
+        pts = list(self.source_coords_nm or []) + list(self.sink_coords_nm or [])
+        if not pts:
+            return list(self.interface_point_nm)
+        return np.mean(np.asarray(pts, dtype=float), axis=0).tolist()
+
+    @property
     def error_type(self) -> str:
         """The error type this operation corrects."""
         return "split" if self.is_merge else "merge"
@@ -532,6 +546,7 @@ def generate_inversion_controls(
                         "original_is_merge": True,
                         "inverted_action": "split",
                         "cutout_timestamp": op.timestamp - 1,  # pre-merge: when A,B exist
+                        "edit_point_nm": op.edit_point_nm,
                     },
                 )
             else:
@@ -554,6 +569,7 @@ def generate_inversion_controls(
                         "original_is_merge": False,
                         "inverted_action": "merge",
                         "cutout_timestamp": op.timestamp + 1,  # post-split: when A,B exist
+                        "edit_point_nm": op.edit_point_nm,
                     },
                 )
 

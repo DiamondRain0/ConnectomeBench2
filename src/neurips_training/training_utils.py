@@ -17,6 +17,7 @@ NO LLRD — only 2-group AdamW. Per Tim 2026-05-07.
 """
 from __future__ import annotations
 
+import datetime
 import math
 import os
 import random
@@ -374,17 +375,17 @@ def build_optimizer(
     """2-group AdamW (no LLRD).
 
     Group 0 — backbone: torchvision-ViT params @ lr * peak_lr_multiplier * backbone_lr_scale
-    Group 1 — heads:    cls_endpoint / cls_junction / cls_synapse / mask_head.decoder /
-                        conv_proj_em @ lr * peak_lr_multiplier
+    Group 1 — everything else (cls heads, mask decoder, mask view embedding,
+              conv_proj_em) @ lr * peak_lr_multiplier
+
+    (The original release enumerated head modules by hand and silently left
+    `mask_head.view_emb` out of both groups, so it was never trained.)
     """
     base_lr = lr * peak_lr_multiplier
-    backbone_params = list(model.backbone.parameters())
-    head_param_ids: set[int] = set()
-    for m in (model.cls_endpoint, model.cls_junction, model.cls_synapse,
-              model.mask_head.decoder, model.conv_proj_em):
-        for p in m.parameters():
-            head_param_ids.add(id(p))
-    head_params = [p for p in model.parameters() if id(p) in head_param_ids]
+    backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+    backbone_ids = {id(p) for p in model.backbone.parameters()}
+    head_params = [p for p in model.parameters()
+                   if id(p) not in backbone_ids and p.requires_grad]
     return torch.optim.AdamW(
         [
             {"params": backbone_params, "lr": base_lr * backbone_lr_scale},
@@ -555,11 +556,19 @@ def setup_ddp(
     master_port: str = "29500",
     backend: str = "nccl",
 ) -> None:
-    """Initialise NCCL process group. Idempotent against repeat env-var sets."""
+    """Initialise NCCL process group. Idempotent against repeat env-var sets.
+
+    Validation runs on rank 0 only while the other ranks wait at a barrier. On slow
+    storage one validation pass can exceed NCCL's
+    default 10-minute collective timeout, and the watchdog then aborts the job.
+    The timeout is therefore raised (default 120 min, override with CB2_DDP_TIMEOUT_MIN).
+    """
     os.environ.setdefault("MASTER_ADDR", master_addr)
     os.environ.setdefault("MASTER_PORT", master_port)
+    timeout_min = int(os.environ.get("CB2_DDP_TIMEOUT_MIN", "120"))
     if not dist.is_initialized():
-        dist.init_process_group(backend, rank=int(rank), world_size=int(world_size))
+        dist.init_process_group(backend, rank=int(rank), world_size=int(world_size),
+                                timeout=datetime.timedelta(minutes=timeout_min))
 
 
 def teardown_ddp() -> None:
@@ -570,6 +579,258 @@ def teardown_ddp() -> None:
 # ───────────────────────────── run_eval ──────────────────────────────────
 
 _MODALITY_TAG = {MODALITY_GEOM: "geom", MODALITY_EM: "em"}
+_HEAD_TAG = {TASK_ENDPOINT: "end_corr", TASK_JUNCTION: "jn_id"}
+
+
+def compute_adaptive_ece(probs_true: np.ndarray, labels: np.ndarray, n_bins: int = 15) -> float:
+    """Adaptive (equal-mass) ECE [Nixon et al. 2019], binary, confidence = max(p, 1-p).
+
+    The paper reports 15-bin adaptive ECE (Fig. 4a)."""
+    n = len(labels)
+    if n == 0:
+        return float("nan")
+    p = probs_true.astype(np.float64)
+    preds = (p >= 0.5).astype(np.int64)
+    conf = np.where(preds == 1, p, 1.0 - p)
+    correct = (preds == labels.astype(np.int64)).astype(np.float64)
+    order = np.argsort(conf, kind="stable")
+    ece = 0.0
+    for chunk in np.array_split(order, min(n_bins, n)):
+        if len(chunk) == 0:
+            continue
+        ece += abs(conf[chunk].mean() - correct[chunk].mean()) * len(chunk) / n
+    return float(ece)
+
+
+def compute_sharpness(probs_true: np.ndarray) -> float:
+    """Normalised sharpness Var(p) / [p̄(1-p̄)] (paper Fig. 4a)."""
+    if len(probs_true) == 0:
+        return float("nan")
+    p = probs_true.astype(np.float64)
+    pb = p.mean()
+    denom = pb * (1 - pb)
+    return float(p.var() / denom) if denom > 0 else float("nan")
+
+
+def _tpr_tnr(labels: np.ndarray, preds: np.ndarray) -> tuple[float, float]:
+    pos, neg = labels == 1, labels == 0
+    tpr = float((preds[pos] == 1).mean()) if pos.any() else float("nan")
+    tnr = float((preds[neg] == 0).mean()) if neg.any() else float("nan")
+    return tpr, tnr
+
+
+def binary_metrics(probs_true: np.ndarray, labels: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
+    """bAcc / acc / TPR / TNR / ROC-AUC / ECE-15 / adaptive ECE-15 / sharpness / n."""
+    labels = np.asarray(labels, dtype=np.int64)
+    probs_true = np.asarray(probs_true, dtype=np.float64)
+    preds = (probs_true >= threshold).astype(np.int64)
+    tpr, tnr = _tpr_tnr(labels, preds)
+    return {
+        "acc": float((preds == labels).mean()) if len(labels) else float("nan"),
+        "bal_acc": _per_class_accuracy(labels, preds),
+        "tpr": tpr,
+        "tnr": tnr,
+        "roc_auc": compute_roc_auc(probs_true, labels),
+        "ece": compute_ece(probs_true, labels),
+        "ece_adaptive": compute_adaptive_ece(probs_true, labels),
+        "sharpness": compute_sharpness(probs_true),
+        "n": float(len(labels)),
+    }
+
+
+def collect_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    label_smoothing: float = 0.1,
+    mask_ce_weight: float = 0.5,
+    return_features: bool = False,
+    use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    max_batches: int | None = None,
+    progress: bool = False,
+):
+    """Run the model over `loader` and return a per-view prediction table.
+
+    Columns: op_id (= combined_sample_hash, one row of the dataset), species,
+    kind, sample_type, modality, view_idx, task_id, label, p_true (the routed
+    head's P(class 1)), cls_loss, p_endpoint, p_junction, has_synapse_label,
+    synapse_label, p_synapse, synapse_loss, has_mask_gt, iou_a, iou_b, miou,
+    mask_loss. Optionally also returns (N, D) float16 CLS features (row-aligned).
+    """
+    import pandas as pd
+
+    model.eval()
+    ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing, reduction="none")
+    cols: dict[str, list] = defaultdict(list)
+    feats: list[np.ndarray] = []
+    amp_on = use_amp and device.type == "cuda"
+
+    it = loader
+    if progress:
+        try:
+            from tqdm import tqdm
+            it = tqdm(loader, desc="eval", dynamic_ncols=True)
+        except ImportError:
+            pass
+
+    with torch.no_grad():
+        for b_i, batch in enumerate(it):
+            if max_batches is not None and b_i >= max_batches:
+                break
+            x = batch["input"].to(device, non_blocking=True)
+            modality = batch["modality"].to(device, non_blocking=True)
+            view_idx = batch["view_idx"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_on):
+                out = model(x, modality, view_idx=view_idx, return_features=return_features)
+            ep_logits, jn_logits, mask_logits, syn_logits = (o.float() for o in out[:4])
+            task_id = batch["task_id"].to(device)
+            label = batch["cls_label"].to(device)
+            syn_label = batch["synapse_label"].to(device)
+
+            routed_logits = torch.where((task_id == TASK_JUNCTION)[:, None], jn_logits, ep_logits)
+            p_ep = torch.softmax(ep_logits, -1)[:, 1]
+            p_jn = torch.softmax(jn_logits, -1)[:, 1]
+            p_syn = torch.softmax(syn_logits, -1)[:, 1]
+            p_true = torch.softmax(routed_logits, -1)[:, 1]
+            cls_loss = ce(routed_logits, label)
+            syn_loss = ce(syn_logits, syn_label)
+
+            bsz = x.shape[0]
+            iou_a = np.full(bsz, np.nan, dtype=np.float32)
+            iou_b = np.full(bsz, np.nan, dtype=np.float32)
+            mask_loss = np.full(bsz, np.nan, dtype=np.float32)
+            has_mask = batch["has_mask_gt"]
+            if has_mask.any():
+                idx_cpu = has_mask.nonzero(as_tuple=True)[0]
+                idx = idx_cpu.to(device)
+                sub_logits = mask_logits.index_select(0, idx)
+                sub_t = batch["mask_label"].index_select(0, idx_cpu).to(device)
+                ml = binary_softmax_ce_dice_invariant_loss(
+                    sub_logits, sub_t, ce_weight=mask_ce_weight, reduction="none")
+                ia, ib = compute_iou_invariant_batched(sub_logits, sub_t)
+                sel = idx_cpu.numpy()
+                iou_a[sel] = ia.cpu().numpy()
+                iou_b[sel] = ib.cpu().numpy()
+                mask_loss[sel] = ml.cpu().numpy()
+
+            stacked = torch.stack([p_true, cls_loss, p_ep, p_jn, p_syn, syn_loss]).cpu().numpy()
+            cols["op_id"] += list(batch["op_id"])
+            cols["species"] += list(batch["species"])
+            cols["kind"] += list(batch["kind"])
+            cols["sample_type"] += list(batch["sample_type"])
+            cols["modality"] += [_MODALITY_TAG[int(m)] for m in batch["modality"].tolist()]
+            cols["view_idx"] += batch["view_idx"].tolist()
+            cols["task_id"] += batch["task_id"].tolist()
+            cols["label"] += batch["cls_label"].tolist()
+            cols["p_true"] += stacked[0].tolist()
+            cols["cls_loss"] += stacked[1].tolist()
+            cols["p_endpoint"] += stacked[2].tolist()
+            cols["p_junction"] += stacked[3].tolist()
+            cols["p_synapse"] += stacked[4].tolist()
+            cols["synapse_loss"] += stacked[5].tolist()
+            cols["has_synapse_label"] += batch["has_synapse_label"].tolist()
+            cols["synapse_label"] += batch["synapse_label"].tolist()
+            cols["has_mask_gt"] += has_mask.tolist()
+            cols["iou_a"] += iou_a.tolist()
+            cols["iou_b"] += iou_b.tolist()
+            cols["mask_loss"] += mask_loss.tolist()
+            if return_features:
+                feats.append(out[4].float().cpu().numpy().astype(np.float16))
+
+    df = pd.DataFrame(cols)
+    if len(df):
+        df["miou"] = df[["iou_a", "iou_b"]].mean(axis=1, skipna=True)
+    else:
+        df["miou"] = []
+    if return_features:
+        F_ = np.concatenate(feats, 0) if feats else np.zeros((0, 0), np.float16)
+        return df, F_
+    return df
+
+
+def per_op_table(df, prob_col: str = "p_true", label_col: str = "label",
+                 extra_keys: tuple[str, ...] = ("species", "kind", "sample_type")):
+    """Aggregate per-view rows → one row per (op, task): mean view probability.
+
+    Ops whose views disagree on the label are dropped (should never happen)."""
+    import pandas as pd
+    if len(df) == 0:
+        return pd.DataFrame(columns=["op_id", "task_id", label_col, prob_col, "n_views", *extra_keys])
+    g = df.groupby(["op_id", "task_id"], sort=False)
+    agg = g.agg(**{prob_col: (prob_col, "mean"),
+                   "_lab_min": (label_col, "min"), "_lab_max": (label_col, "max"),
+                   "n_views": (prob_col, "size"),
+                   **{k: (k, "first") for k in extra_keys}}).reset_index()
+    agg = agg[agg["_lab_min"] == agg["_lab_max"]].rename(columns={"_lab_min": label_col})
+    return agg.drop(columns=["_lab_max"])
+
+
+def metrics_from_predictions(df, split_tag: str = "val") -> dict[str, float]:
+    """Flat metrics dict from the per-view table (wandb/JSON-ready).
+
+    Keys: `{head}[/{slice}]/{split}_{metric}_{per_image|mean_prob}` where head
+    ∈ {end_corr, jn_id, synapse}, slice ∈ {species, species_kind, modality,
+    modality/species_kind}; mask: `mask[/{slice}]/{split}_mIoU_inv` etc.
+    The headline numbers of the paper are `end_corr/{split}_bal_acc_mean_prob`
+    (Split Error bAcc), `jn_id/{split}_bal_acc_mean_prob` (Merge Error bAcc)
+    and `mask/{split}_mIoU_inv`.
+    """
+    out: dict[str, float] = {}
+    s = split_tag
+    if len(df) == 0:
+        return out
+    df = df.copy()
+    df["species_kind"] = df["species"].astype(str) + "_" + df["kind"].astype(str)
+
+    def _cls_block(prefix: str, sub, prob_col: str, label_col: str):
+        slices = [(None, sub)]
+        for col in ("species", "species_kind", "modality"):
+            for key, part in sub.groupby(col, sort=True):
+                slices.append((str(key), part))
+        for (mod, sk), part in sub.groupby(["modality", "species_kind"], sort=True):
+            slices.append((f"{mod}/{sk}", part))
+        for key, part in slices:
+            tag = prefix if key is None else f"{prefix}/{key}"
+            pi = binary_metrics(part[prob_col].to_numpy(), part[label_col].to_numpy())
+            for m, v in pi.items():
+                out[f"{tag}/{s}_{m}_per_image"] = v
+            op = per_op_table(part.rename(columns={prob_col: "_p", label_col: "_l"}),
+                              prob_col="_p", label_col="_l", extra_keys=())
+            po = binary_metrics(op["_p"].to_numpy(), op["_l"].to_numpy())
+            for m, v in po.items():
+                out[f"{tag}/{s}_{m}_mean_prob"] = v
+            # majority vote (per-view vote, tie → most confident view)
+            maj = part.groupby("op_id")[prob_col].apply(lambda a: aggregate_majority_vote(a.to_numpy()))
+            lab = part.groupby("op_id")[label_col].first()
+            out[f"{tag}/{s}_acc_majority"] = float((maj.astype(int) == lab.astype(int)).mean())
+            out[f"{tag}/{s}_loss"] = float(part["_loss"].mean()) if "_loss" in part else float("nan")
+            # legacy aliases used by the training-loop printout / checkpoint selection
+            out[f"{tag}/{s}_n_mean_prob"] = po["n"]
+
+    for tid, prefix in _HEAD_TAG.items():
+        sub = df[df["task_id"] == tid].assign(_loss=lambda d: d["cls_loss"])
+        if len(sub):
+            _cls_block(prefix, sub, "p_true", "label")
+    syn = df[df["has_synapse_label"]].assign(_loss=lambda d: d["synapse_loss"])
+    if len(syn):
+        _cls_block("synapse", syn, "p_synapse", "synapse_label")
+
+    m = df[df["has_mask_gt"]]
+    if len(m):
+        for key, part in [(None, m), *[(str(k), p) for k, p in m.groupby("species")],
+                          *[(str(k), p) for k, p in m.groupby("species_kind")]]:
+            tag = "mask" if key is None else f"mask/{key}"
+            out[f"{tag}/{s}_mIoU_inv"] = float(np.nanmean(part["miou"])) if part["miou"].notna().any() else float("nan")
+            out[f"{tag}/{s}_IoU_A"] = float(np.nanmean(part["iou_a"])) if part["iou_a"].notna().any() else float("nan")
+            out[f"{tag}/{s}_IoU_B"] = float(np.nanmean(part["iou_b"])) if part["iou_b"].notna().any() else float("nan")
+            out[f"{tag}/{s}_loss"] = float(np.nanmean(part["mask_loss"]))
+            out[f"{tag}/{s}_n_samples"] = float(len(part))
+            # per-op best view (paper Table 6 also reports per-op best mIoU)
+            best = part.groupby("op_id")["miou"].max()
+            out[f"{tag}/{s}_mIoU_inv_per_op_best"] = float(np.nanmean(best)) if best.notna().any() else float("nan")
+    return out
 
 
 def run_eval(
@@ -584,227 +845,32 @@ def run_eval(
     loss_scale_mask: float = 1.0,
     loss_scale_synapse: float = 0.25,
     return_raw: bool = False,
-) -> dict[str, float] | tuple[dict[str, float], dict[str, Any]]:
-    """Full eval. Returns wandb-ready flat dict with namespaced keys.
+    split_tag: str = "val",
+    progress: bool = False,
+):
+    """Full eval → flat metrics dict (and the per-view prediction table if `return_raw`).
 
-    Slices: `None` (global), per-`{species}_{kind}`, per-modality (`geom`/`em`),
-    per-`{modality}/{species}_{kind}`.
-
-    Per-task gating: each cls head only scores rows whose `task_id` routed
-    them to that head during training. Mask head only scores rows with
-    `has_mask_gt=True`. Synapse aux only scores `has_synapse_label=True`.
-
-    Per-image AND per-op (mean_prob, majority_vote) variants for cls heads.
-
-    Vendored from unified-script `run_eval` (line 1771) with the cfg
-    dataclass replaced by explicit kwargs.
+    Per-task gating: each cls head is only scored on rows routed to it; the
+    mask head on rows with GT; the synapse head on rows with a synapse label.
+    Per-image and per-op (mean view probability, threshold 0.5) variants.
     """
-    model.eval()
+    df = collect_predictions(model, val_loader, device, label_smoothing=label_smoothing,
+                             mask_ce_weight=mask_ce_weight, progress=progress)
+    out = metrics_from_predictions(df, split_tag=split_tag)
+    s = split_tag
 
-    ep_rec: dict[str | None, dict[str, list]] = {None: {"labels": [], "probs": [], "ops": []}}
-    jn_rec: dict[str | None, dict[str, list]] = {None: {"labels": [], "probs": [], "ops": []}}
-    syn_rec: dict[str | None, dict[str, list]] = {None: {"labels": [], "probs": [], "ops": []}}
-    mask_rec: dict[str | None, dict[str, list]] = {None: {"a": [], "b": [], "miou": []}}
+    def _g(k):
+        v = out.get(k, float("nan"))
+        return 0.0 if (isinstance(v, float) and math.isnan(v)) else v
 
-    ep_loss_rec: dict[str | None, list[float]] = {None: []}
-    jn_loss_rec: dict[str | None, list[float]] = {None: []}
-    syn_loss_rec: dict[str | None, list[float]] = {None: []}
-    mask_loss_rec: dict[str | None, list[float]] = {None: []}
-    ce_per_sample = nn.CrossEntropyLoss(label_smoothing=label_smoothing, reduction="none")
-
-    def _ep_slice(key): return ep_rec.setdefault(key, {"labels": [], "probs": [], "ops": []})
-    def _jn_slice(key): return jn_rec.setdefault(key, {"labels": [], "probs": [], "ops": []})
-    def _syn_slice(key): return syn_rec.setdefault(key, {"labels": [], "probs": [], "ops": []})
-    def _mask_slice(key): return mask_rec.setdefault(key, {"a": [], "b": [], "miou": []})
-
-    with torch.no_grad():
-        for batch in val_loader:
-            x = batch["input"].to(device, non_blocking=True)
-            modality = batch["modality"].to(device, non_blocking=True)
-            ep_logits, jn_logits, mask_logits, syn_logits = model(x, modality)
-            task_id = batch["task_id"]
-            cls_label_cpu = batch["cls_label"]
-            op_ids = batch["op_id"]
-            species_list = batch["species"]
-            kind_list = batch["kind"]
-            modality_cpu = batch["modality"]
-            has_mask_gt = batch["has_mask_gt"]
-            has_synapse_cpu = batch["has_synapse_label"]
-            synapse_label_cpu = batch["synapse_label"]
-            synapse_label_gpu = synapse_label_cpu.to(device, non_blocking=True)
-
-            # Task-gated labels: each head sees zeros for rows it didn't train on,
-            # then the has_*_label gate filters them out from metrics below.
-            bsz = len(op_ids)
-            ep_label_list = [0] * bsz
-            jn_label_list = [0] * bsz
-            has_ep_label_list = [False] * bsz
-            has_jn_label_list = [False] * bsz
-            kind_list_local = list(kind_list)
-            task_id_list = task_id.tolist()
-            cls_label_list = cls_label_cpu.tolist()
-            for j in range(bsz):
-                cls = int(cls_label_list[j])
-                tid = int(task_id_list[j])
-                if tid == TASK_ENDPOINT:
-                    ep_label_list[j] = cls
-                    has_ep_label_list[j] = True
-                elif tid == TASK_JUNCTION:
-                    jn_label_list[j] = cls
-                    has_jn_label_list[j] = True
-
-            ep_label_gpu = torch.tensor(ep_label_list, dtype=torch.long, device=device)
-            jn_label_gpu = torch.tensor(jn_label_list, dtype=torch.long, device=device)
-
-            # Single sync per batch: stack all 6 per-sample scalars, one .tolist().
-            ep_prob, jn_prob, syn_prob, ep_ce, jn_ce, syn_ce = torch.stack([
-                torch.softmax(ep_logits, dim=-1)[:, 1],
-                torch.softmax(jn_logits, dim=-1)[:, 1],
-                torch.softmax(syn_logits, dim=-1)[:, 1],
-                ce_per_sample(ep_logits, ep_label_gpu).detach(),
-                ce_per_sample(jn_logits, jn_label_gpu).detach(),
-                ce_per_sample(syn_logits, synapse_label_gpu).detach(),
-            ], dim=0).tolist()
-            has_synapse_list = has_synapse_cpu.tolist()
-            synapse_label_list = synapse_label_cpu.tolist()
-
-            for i, (op, sp, kd, md) in enumerate(zip(
-                op_ids, species_list, kind_list_local, modality_cpu.tolist(),
-            )):
-                mtag = _MODALITY_TAG[md]
-                slice_keys = [f"{sp}_{kd}", mtag, f"{mtag}/{sp}_{kd}"]
-
-                if has_ep_label_list[i]:
-                    ep_rec[None]["labels"].append(ep_label_list[i])
-                    ep_rec[None]["probs"].append(float(ep_prob[i]))
-                    ep_rec[None]["ops"].append(op)
-                    ep_loss_rec[None].append(float(ep_ce[i]))
-                    for k in slice_keys:
-                        s = _ep_slice(k)
-                        s["labels"].append(ep_label_list[i])
-                        s["probs"].append(float(ep_prob[i]))
-                        s["ops"].append(op)
-                        ep_loss_rec.setdefault(k, []).append(float(ep_ce[i]))
-
-                if has_jn_label_list[i]:
-                    jn_rec[None]["labels"].append(jn_label_list[i])
-                    jn_rec[None]["probs"].append(float(jn_prob[i]))
-                    jn_rec[None]["ops"].append(op)
-                    jn_loss_rec[None].append(float(jn_ce[i]))
-                    for k in slice_keys:
-                        s = _jn_slice(k)
-                        s["labels"].append(jn_label_list[i])
-                        s["probs"].append(float(jn_prob[i]))
-                        s["ops"].append(op)
-                        jn_loss_rec.setdefault(k, []).append(float(jn_ce[i]))
-
-                if has_synapse_list[i]:
-                    syn_lab = int(synapse_label_list[i])
-                    syn_rec[None]["labels"].append(syn_lab)
-                    syn_rec[None]["probs"].append(float(syn_prob[i]))
-                    syn_rec[None]["ops"].append(op)
-                    syn_loss_rec[None].append(float(syn_ce[i]))
-                    for k in slice_keys:
-                        s = _syn_slice(k)
-                        s["labels"].append(syn_lab)
-                        s["probs"].append(float(syn_prob[i]))
-                        s["ops"].append(op)
-                        syn_loss_rec.setdefault(k, []).append(float(syn_ce[i]))
-
-            if has_mask_gt.any():
-                mask_idx_cpu = has_mask_gt.nonzero(as_tuple=True)[0]
-                mask_idx_gpu = mask_idx_cpu.to(device)
-                sub_logits = mask_logits.index_select(0, mask_idx_gpu).float()
-                sub_targets = batch["mask_label"].index_select(0, mask_idx_cpu).to(device, non_blocking=True)
-                sub_losses = binary_softmax_ce_dice_invariant_loss(
-                    sub_logits, sub_targets, ce_weight=mask_ce_weight, reduction="none",
-                ).detach().cpu().numpy()
-                iou_a_t, iou_b_t = compute_iou_invariant_batched(sub_logits, sub_targets)
-                iou_a_arr = iou_a_t.detach().cpu().numpy()
-                iou_b_arr = iou_b_t.detach().cpu().numpy()
-                for j, i in enumerate(mask_idx_cpu.tolist()):
-                    per_sample_loss = float(sub_losses[j])
-                    slice_key = f"{species_list[i]}_{kind_list[i]}"
-                    mask_loss_rec[None].append(per_sample_loss)
-                    mask_loss_rec.setdefault(slice_key, []).append(per_sample_loss)
-                    iou_a = float(iou_a_arr[j])
-                    iou_b = float(iou_b_arr[j])
-                    valid = [v for v in (iou_a, iou_b) if not math.isnan(v)]
-                    miou = float(np.mean(valid)) if valid else float("nan")
-                    for k, store in ((None, mask_rec[None]), (slice_key, _mask_slice(slice_key))):
-                        store["a"].append(iou_a)
-                        store["b"].append(iou_b)
-                        store["miou"].append(miou)
-
-    out: dict[str, float] = {}
-
-    def _finalize_cls(prefix: str, rec: dict[str | None, dict[str, list]]) -> None:
-        for slice_key, data in rec.items():
-            tag = prefix if slice_key is None else f"{prefix}/{slice_key}"
-            labels_np = np.array(data["labels"], dtype=np.int64)
-            probs_np = np.array(data["probs"], dtype=np.float32)
-            preds_np = (probs_np >= 0.5).astype(np.int64)
-            pi = cls_metrics(labels_np, preds_np)
-            agg = _aggregate_cls(data["ops"], labels_np, probs_np)
-            out[f"{tag}/val_acc_per_image"] = pi["acc"]
-            out[f"{tag}/val_bal_acc_per_image"] = pi["bal_acc"]
-            out[f"{tag}/val_n_per_image"] = float(pi["n"])
-            out[f"{tag}/val_ece_per_image"] = compute_ece(probs_np, labels_np)
-            out[f"{tag}/val_roc_auc_per_image"] = compute_roc_auc(probs_np, labels_np)
-            out[f"{tag}/val_acc_mean_prob"] = agg["mean_prob_acc"]
-            out[f"{tag}/val_bal_acc_mean_prob"] = agg["mean_prob_bal_acc"]
-            out[f"{tag}/val_acc_majority"] = agg["majority_acc"]
-            out[f"{tag}/val_n_mean_prob"] = float(agg["n_ops"])
-            out[f"{tag}/val_ece_mean_prob"] = compute_ece(agg["mean_probs_np"], agg["labels_np"])
-            out[f"{tag}/val_roc_auc_mean_prob"] = compute_roc_auc(agg["mean_probs_np"], agg["labels_np"])
-
-    _finalize_cls("end_corr", ep_rec)
-    _finalize_cls("jn_id", jn_rec)
-    _finalize_cls("synapse", syn_rec)
-
-    for slice_key, data in mask_rec.items():
-        tag = "mask" if slice_key is None else f"mask/{slice_key}"
-        out[f"{tag}/val_mIoU_inv"] = nanmean(data["miou"])
-        out[f"{tag}/val_IoU_A"] = nanmean(data["a"])
-        out[f"{tag}/val_IoU_B"] = nanmean(data["b"])
-        out[f"{tag}/val_n_samples"] = float(len(data["miou"]))
-
-    for slice_key, vals in ep_loss_rec.items():
-        tag = "end_corr" if slice_key is None else f"end_corr/{slice_key}"
-        out[f"{tag}/val_loss"] = nanmean(vals)
-    for slice_key, vals in jn_loss_rec.items():
-        tag = "jn_id" if slice_key is None else f"jn_id/{slice_key}"
-        out[f"{tag}/val_loss"] = nanmean(vals)
-    for slice_key, vals in mask_loss_rec.items():
-        tag = "mask" if slice_key is None else f"mask/{slice_key}"
-        out[f"{tag}/val_loss"] = nanmean(vals)
-    for slice_key, vals in syn_loss_rec.items():
-        tag = "synapse" if slice_key is None else f"synapse/{slice_key}"
-        out[f"{tag}/val_loss"] = nanmean(vals)
-    out["val/total_loss"] = (
-        loss_scale_endpoint * (out.get("end_corr/val_loss") or 0.0)
-        + loss_scale_junction * (out.get("jn_id/val_loss") or 0.0)
-        + loss_scale_mask * (out.get("mask/val_loss") or 0.0)
-        + loss_scale_synapse * (out.get("synapse/val_loss") or 0.0)
+    out[f"{s}/total_loss"] = (
+        loss_scale_endpoint * _g(f"end_corr/{s}_loss")
+        + loss_scale_junction * _g(f"jn_id/{s}_loss")
+        + loss_scale_mask * _g(f"mask/{s}_loss")
+        + loss_scale_synapse * _g(f"synapse/{s}_loss")
     )
-
     if return_raw:
-        raw = {
-            "end_corr": {(str(k) if k is not None else "_global"):
-                         {"labels": list(v["labels"]), "probs": list(v["probs"]), "ops": list(v["ops"])}
-                         for k, v in ep_rec.items()},
-            "jn_id": {(str(k) if k is not None else "_global"):
-                      {"labels": list(v["labels"]), "probs": list(v["probs"]), "ops": list(v["ops"])}
-                      for k, v in jn_rec.items()},
-            "synapse": {(str(k) if k is not None else "_global"):
-                        {"labels": list(v["labels"]), "probs": list(v["probs"]), "ops": list(v["ops"])}
-                        for k, v in syn_rec.items()},
-            "mask": {(str(k) if k is not None else "_global"):
-                     {"iou_a": list(v["a"]), "iou_b": list(v["b"]), "miou": list(v["miou"])}
-                     for k, v in mask_rec.items()},
-        }
-        return out, raw
-
+        return out, df
     return out
 
 
@@ -857,7 +923,8 @@ def make_mask_viz_grid(
             picks = eligible[:n_max]
             x = batch["input"].to(device, non_blocking=True)
             mod_gpu = batch["modality"].to(device, non_blocking=True)
-            _, _, mask_logits, _ = model(x, mod_gpu)
+            vidx = batch["view_idx"].to(device, non_blocking=True)
+            _, _, mask_logits, _ = model(x, mod_gpu, view_idx=vidx)
             for i in picks.tolist():
                 rows.append(make_viz_row(
                     batch["input"][i],
@@ -881,8 +948,9 @@ __all__ = [
     # metrics
     "compute_ece", "compute_roc_auc", "cls_metrics", "nanmean",
     "aggregate_mean_prob", "aggregate_majority_vote", "_aggregate_cls",
+    "compute_adaptive_ece", "compute_sharpness", "binary_metrics",
     # eval orchestration
-    "run_eval",
+    "run_eval", "collect_predictions", "per_op_table", "metrics_from_predictions",
     # DDP
     "ddp_active", "ddp_unwrap", "ddp_all_reduce_metrics",
     "setup_ddp", "teardown_ddp",

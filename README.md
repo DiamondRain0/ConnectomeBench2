@@ -20,11 +20,15 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### 3. Create the environment
 
 ```bash
-uv sync
+uv sync --extra train            # training / evaluation on the released dataset (GPU box)
+uv sync --extra datagen          # data generation from CAVE + mesh rendering
+uv sync --extra train --extra datagen   # both
 source .venv/bin/activate
 ```
 
-Python 3.11 is pinned (FM-stack / `pcg-skel` constraint). `uv sync` installs every dep from `pyproject.toml` — no `pixi`, no `graph-tool`, no `pychunkedgraph` dance.
+Python 3.11 is pinned (FM-stack / `pcg-skel` constraint). Training only needs the `train`
+extra (torch, torchvision, scikit-learn, huggingface_hub, wandb); the rendering stack
+(`pygfx`, `octarine3d`, CAVE clients) is only needed for `datagen`.
 
 ### 4. Set `PYTHONPATH`
 
@@ -85,45 +89,173 @@ python -m training.training_data_renderer \
 ```
 
 Outputs a per-task parquet + `images/` (geometry `.npy` + EM cardinal/oblique `.png` slices).
-
-### Build the unified NeurIPS parquet (two-stage pipeline)
-
-Run in order (second consumes the previous stage's output):
+The unified config renders both geometry flavours (`render_modes: [geometry, geometry_single]`);
+add the split-mask labels for split edits with a second pass:
 
 ```bash
-python scripts/data_generation/neurips/build_giga_parquet.py
-python scripts/data_generation/neurips/postprocess_giga_parquet.py
+python -m training.training_data_renderer --config configs/renderer_config_neurips_unified.yaml     --species mouse --input ... --output test_outputs/ --split-mask-enrich
 ```
 
-Final output: `combined.parquet` (17 columns, geom + EM, 4 species).
+### Package into the ConnectomeBench2 v2 format
 
-To get the sharded parquet format found on HuggingFace, use:
+The packaging scripts produce exactly the schema of the released v2 dataset
+(`jeffbbrown2/ConnectomeBench2@v2`), so new or re-generated samples can be mixed with it.
+
+**1. Split table (once).** v2 assigns train/val/test per 80 µm cube. The authors' per-cube
+hash is not public, so the cube→split table is recovered from the released rows; samples in
+cubes covered by the release get the release's split, unseen cubes get a deterministic
+75/12.5/12.5 hash:
 
 ```bash
-python scripts/data_generation/neurips/build_parquet_dataset.py
+python scripts/data_generation/neurips/build_v2_cube_splits.py     --dataset /data/ConnectomeBench2 --out configs/cube_splits_v2   # or --hf to stream metadata only
 ```
 
-### Train the multi-task ViT
+It prints a *purity* per species (fraction of released samples that agree with their cube's
+split) and exits non-zero below 0.99. The grid origin comes from CloudVolume (needs `env.sh`)
+or is inferred from the data (`--origin infer`).
 
-Single-GPU smoke test:
+**2. Combine → v2 semantics → HF shards:**
 
 ```bash
-python scripts/training/training.py \
-    --blend-config scripts/training/configs/full_4sp.yaml \
-    --epochs 10 \
-    --batch-size 64
+python scripts/data_generation/neurips/build_giga_parquet.py --out-root <render_root>
+python scripts/data_generation/neurips/postprocess_giga_parquet.py --parquet <render_root>/combined.parquet
+python scripts/data_generation/neurips/build_parquet_dataset.py --parquet <render_root>/combined.parquet --out-root <hf_root>
 ```
 
-Multi-GPU (DDP via `torchrun`):
+`build_giga_parquet.py` picks up every `<render_root>/<subdir>/questions.parquet`.
+`postprocess_giga_parquet.py` maps archives to `unified_<sp>` / `unified_controls_<sp>`, derives
+`sample_type`, picks the dual/single `geometry` per task, renames EM to `em_*_before`, keeps split
+masks for split edits, sets nullable labels / `task_routing` / `has_after_mask`, and assigns the
+v2 split (rows missing the needed geometry or any EM view are dropped, as in v2).
+`build_parquet_dataset.py` writes the v2 columns, converting split masks to v2's
+0 = A / 1 = B / 255 = background encoding.
+
+Offline check of the whole chain (no CAVE, no rendering; compares against the released schema):
 
 ```bash
-torchrun --nproc-per-node=2 scripts/training/training.py \
-    --blend-config scripts/training/configs/full_4sp.yaml \
-    --epochs 20 --batch-size 128 \
-    --wandb
+python scripts/data_generation/neurips/smoke_test_v2_packaging.py --reference /data/ConnectomeBench2/demo.parquet
 ```
 
-See `scripts/training/training.py --help` for the full flag set (warmstart, FM checkpoint init, loss-scale per task, mask CE weight, etc.).
+`configs/cube_splits/` holds the old v1 splits (50 µm cubes, 80/10/10); they are not used for v2.
+
+## Reproducing the paper (training on the released dataset)
+
+All training code lives in `src/neurips_training/`; helper scripts in `scripts/training/`.
+**Lab setup with a data machine + compute machines on shared storage: see [docs/LAB_SETUP.md](docs/LAB_SETUP.md).**
+The loader auto-detects the dataset schema; the paper's numbers use the **v2** release
+(HF branch `v2`, 716,485 rows, ~230 GB).
+
+### 0. Smoke test (CPU, ~1-2 minutes, no GPU needed)
+
+```bash
+python scripts/training/smoke_test.py
+```
+
+Builds a fake train/val/test tree from the 20-row `demo.parquet` and runs training,
+checkpoint + resume, test evaluation with exports, an ablation and the analysis script.
+
+### 1. Download the dataset
+
+```bash
+python scripts/training/download_dataset.py --out /data/ConnectomeBench2          # full (~230 GB)
+python scripts/training/download_dataset.py --out /data/cb2_small --max-shards 4  # small debug subset
+python scripts/training/download_dataset.py --out /data/ConnectomeBench2 --splits test --verify
+```
+
+### 2. Train the multi-task ViT
+
+Paper recipe (App. B.2) is the default: 20 epochs, AdamW, lr = 1e-4·sqrt(global_bs/32),
+5 warmup epochs + cosine, wd 0.05 / drop-path 0.1 (ViT-B) or 0.1 / 0.25 (ViT-L), label
+smoothing 0.1, bf16, sqrt species×task blend with fly/zebrafish edit weights 0.7/0.5 and
+class balancing, all augmentations. `--batch-size` is the GLOBAL batch size.
+
+```bash
+# single GPU, ViT-B (paper: ~15 H100-hours)
+python src/neurips_training/training.py \
+    --blend-config src/neurips_training/configs/full_4sp.yaml \
+    --parquet-root /data/ConnectomeBench2 --batch-size 256
+
+# multi-GPU, ViT-L (paper: 3xH100, bs 768)
+torchrun --standalone --nproc-per-node=3 src/neurips_training/training.py \
+    --blend-config src/neurips_training/configs/full_4sp.yaml \
+    --parquet-root /data/ConnectomeBench2 --model vit_l_16 --batch-size 768
+
+# resume after an interruption
+python src/neurips_training/training.py ... --resume checkpoints_neurips/neurips_run_last.pt
+```
+
+Checkpoints: `<name>_best.pt` (best val headline = mean of split-error bAcc, merge-error
+bAcc, mask mIoU) and `<name>_last.pt` (with optimizer state). Per-epoch metrics are appended
+to `<name>_metrics.jsonl`; `--wandb` is optional.
+
+### 3. Evaluate on the held-out test set and build the tables
+
+```bash
+python src/neurips_training/training.py --mode evaluate \
+    --blend-config src/neurips_training/configs/full_4sp.yaml --parquet-root /data/ConnectomeBench2 \
+    --checkpoint checkpoints_neurips/neurips_run_best.pt --eval-split test \
+    --export-predictions results/test_full.parquet
+
+# Table 1 inference-time ablations
+...  --modalities geom                      # "ViT-B, geom only"
+...  --modalities geom --ablate shape       # "-shape"   (silhouette + depth zeroed)
+...  --modalities geom --ablate normals     # "-normals"
+...  --modalities geom --ablate masks       # "-masks"
+...  --modalities em                        # "ViT-B, EM only"
+
+python scripts/training/analyze_predictions.py results/test_*.parquet --out-dir results/analysis
+```
+
+`analyze_predictions.py` prints Table 1 / 6 / 7 / 8-style results (per-sample bAcc at 0.5
+with 95% op-clustered bootstrap CIs, mIoU, per-species TPR/TNR, high-confidence coverage)
+and calibration (15-bin adaptive ECE, normalised sharpness, ROC-AUC, 12-bin reliability CSVs).
+
+Everything above in one go: `DATA=/data/ConnectomeBench2 NGPU=1 bash scripts/training/reproduce_paper.sh`.
+
+### 4. Other experiments
+
+* **Data scaling (Fig. 2b):** `--max-samples N --data-subsample-seed S --seed S` (N = 100 … all).
+* **Leave-one-species-out (Fig. 4c):** train with `--include-species mouse,fly,human`, evaluate with
+  `--eval-species zebrafish`; export CLS features with `--export-features` (eval on `--eval-split train`
+  for the in-distribution fit) and run `scripts/training/mahalanobis_ood.py`.
+* **Random / foundation-model init (Fig. 5a):** `--init-source none` / `--init-source fm_checkpoint --fm-checkpoint ...`.
+
+### Changes relative to the original code release
+
+The released training code targeted the **v1** dataset (`v1-may06`) and could not load v2.
+Fixed / added:
+
+* **v2 schema support** (auto-detected): single `geometry` column whose dual/single semantics
+  follow `sample_type`, `em_*_before` columns, split-mask GT from `split_mask_{front,side,top}`
+  (0 = piece A, 1 = piece B, 255 = background), nullable labels, `has_after_mask`.
+* **Leakage guard** from the dataset card: `em_best` is dropped for merge-error identification
+  (`--keep-em-best-for-single` restores it); EM masks are fused for single-segment rows.
+* **Per-op aggregation key** is `combined_sample_hash` (unique); `source_archive_sample_hash`
+  is not unique across archives and could merge different samples.
+* **Sampling = paper:** each epoch draws N rows with replacement according to the blend
+  weights (streaming Poisson equivalent of `WeightedRandomSampler`). The old accept/reject
+  scheme produced ~10x smaller epochs (`--epoch-size-mode accept` keeps it).
+* **Epoch counter shared with persistent DataLoader workers** (previously every epoch reused
+  epoch-0 shard order and sample selection).
+* **Item shuffle buffer** so batches are not clumps of views of the same operation.
+* **Evaluation uses the full split** (previously val was randomly subsampled by the class-balance
+  accept rolls) and **rank-0 eval sees all shards** under DDP (previously only its 1/world share).
+* **`--eval-split test`**, per-species metrics, TPR/TNR, ROC-AUC, adaptive ECE, sharpness,
+  per-view prediction/feature export, inference-time ablations, analysis + Mahalanobis scripts.
+* **DDP:** per-rank epoch length (scheduler length was off by world_size) and synchronized
+  stopping (ranks with fewer batches previously deadlocked the others).
+* **Hyper-parameters = paper App. B.2** (lr reference bs 32, ViT-L wd 0.1 / drop-path 0.25,
+  20 epochs, per-archive blend weights); CLI values are no longer silently overwritten.
+* **Mask-decoder view embedding** (App. B.2) is now applied and trained (`view_emb` existed but
+  was unused and outside every optimizer group). `--no-view-embedding` restores old behaviour.
+* Bilinear (input) / nearest (mask) interpolation for spatial augmentation; resume support;
+  atomic checkpoint writes; dependency fixes (`torch`, `torchvision`, `scikit-learn`,
+  `huggingface_hub` were missing; the unrelated `torchrun` PyPI package was removed).
+
+Not included in this repository (described in the paper but not released): the
+self-supervised foundation-model pretraining (App. B.4), the active-learning experiments
+(App. B.5), mask → supervoxel multicut evaluation (App. B.3, needs `pychunkedgraph`),
+64-view test-time view scaling (needs re-rendering), and occlusion-sensitivity maps.
 
 ## License
 

@@ -216,3 +216,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ConnectomeBench2 run artefacts
+checkpoints_neurips/
+checkpoints/
+results/
+datasets/
+docs/
+wandb/
+*.pt
+env.sh
+
+# lab machine config
+scripts/lab/lab.env
+
+# local run outputs
+runs/
+*.parquet

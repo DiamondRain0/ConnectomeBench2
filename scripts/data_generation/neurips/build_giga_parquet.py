@@ -1,11 +1,16 @@
-"""Build giga_questions.parquet by union-concatenating all sub-archive parquets.
+"""Build combined.parquet by union-concatenating all renderer sub-archive parquets.
 
-Reads from `neurips_dataset_may06/` (post-merge layout), writes a single
-`giga_questions.parquet` next to the sub-archive dirs. Sub-archive dirs stay
-intact so they remain usable in isolation.
+Reads every `<out-root>/<subdir>/questions.parquet` (renderer outputs, e.g.
+`unified_mouse/`, `unified_controls_fly/`, or the older
+`edits_and_adj_controls_mouse/`, `junction_controls_fly/`, ...) and writes a single
+`combined.parquet` next to them. Sub-archive dirs stay intact.
+
+Next step: postprocess_giga_parquet.py (v2 semantics + splits), then
+build_parquet_dataset.py (HF shards).
 
 Per-source transforms:
-  - add `source_archive` = subdir name
+  - add `source_archive` = `source_subdir` = subdir name (postprocess maps
+    `source_archive` to the v2 names `unified_<sp>` / `unified_controls_<sp>`)
   - rename `answer` -> `source_answer` (no cast)
   - stringify `metadata` struct -> JSON string
   - rewrite `images` list paths: "images/x" -> "{source_archive}/images/x"
@@ -29,9 +34,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-OUT_ROOT_DEFAULT = Path.home() / "VLM_Proofreading" / "neurips_dataset_may06"
+OUT_ROOT_DEFAULT = Path.home() / "VLM_Proofreading" / "neurips_dataset"
 
-INPUT_SUBDIRS: list[str] = [
+# Legacy (v1-era) sub-archive names; used only with --legacy-subdirs.
+LEGACY_INPUT_SUBDIRS: list[str] = [
     "edits_and_adj_controls_fly",
     "edits_and_adj_controls_mouse",
     "edits_and_adj_controls_zebrafish",
@@ -102,6 +108,7 @@ def load_one(subdir: Path) -> pd.DataFrame:
             lambda v: None if v is None else str(v)
         )
     df["source_archive"] = archive
+    df["source_subdir"] = archive
     if "metadata" in df.columns:
         df["metadata"] = df["metadata"].map(stringify_metadata)
     if "images" in df.columns:
@@ -165,6 +172,10 @@ def main() -> None:
                     help=f"root containing sub-archive dirs (default: {OUT_ROOT_DEFAULT})")
     ap.add_argument("--dry-run", action="store_true",
                     help="don't write parquet or delete dirs, just print summary")
+    ap.add_argument("--subdirs", default=None,
+                    help="comma list of sub-archive dirs (default: every subdir with questions.parquet)")
+    ap.add_argument("--legacy-subdirs", action="store_true",
+                    help="use the fixed v1-era list of 10 sub-archives")
     ap.add_argument("--cleanup", action="store_true",
                     help="after successful write, rm redundant endjunc/single_masks subdirs")
     args = ap.parse_args()
@@ -175,7 +186,18 @@ def main() -> None:
 
     t0 = time.time()
     frames: list[pd.DataFrame] = []
-    for name in INPUT_SUBDIRS:
+    if args.subdirs:
+        names = [x.strip() for x in args.subdirs.split(",") if x.strip()]
+    elif args.legacy_subdirs:
+        names = LEGACY_INPUT_SUBDIRS
+    else:
+        names = sorted(d.name for d in out_root.iterdir()
+                       if d.is_dir() and (d / "questions.parquet").exists()
+                       and d.name not in REDUNDANT_SUBDIRS)
+    if not names:
+        raise SystemExit(f"no <subdir>/questions.parquet under {out_root}")
+    log.info(f"sub-archives: {names}")
+    for name in names:
         sub = out_root / name
         if not sub.exists():
             raise FileNotFoundError(sub)
